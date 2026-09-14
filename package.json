@@ -1,15 +1,15 @@
 {
+  "name": "hxwl-inspection-workbench",
+  "version": "1.0.0",
+  "description": "航空维修班组检查协作台：模板版本化、缺陷闭环、双人签署、离线编辑、整包导入导出",
+  "private": true,
   "scripts": {
-    "dev": "vite --host 0.0.0.0 --port 5107",
-    "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 5107"
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.0.0",
-    "vite": "^7.0.0",
-    "typescript": "^5.8.3",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "express": "^5.2.1"
   },
   "devDependencies": {}
 }
