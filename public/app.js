@@ -1,10 +1,15 @@
 "use strict";
 /* 航空维修检查协作台 前端 SPA（原生 JS，无构建）
  * 能力：登录/看板/模板编辑发布/检查单录入/缺陷闭环/双人签署/撤销/导入导出
- *      离线编辑（localStorage 草稿 + 操作队列，联网自动同步，刷新不丢）
- *      多标签冲突提示（BroadcastChannel + 服务端 409 乐观锁）
+ * 离线：已访问的检查单离线可编辑（结果入队 + 缓存合并渲染），刷新后保留，联网自动同步
+ * 冲突：同步时基线比对，保留双方内容，用户明示选择后才提交，禁止静默覆盖/重复签署
+ * 权限：工程师（录入/附件/处置）与检验（复检/签署）在页面与接口两层一致落实
  */
 (function () {
+  // 注册应用外壳缓存：断网刷新页面仍可加载，数据由 localStorage 恢复
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  }
   /* ---------------- 状态与存储 ---------------- */
   const LS = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -17,20 +22,24 @@
     view: "dash",
     templates: [],
     instances: [],
-    instance: null,       // 当前打开的检查单（含 items 计算）
-    template: null,       // 当前打开的模板
-    tplDraft: null,       // 模板草稿编辑中的 items
-    openItems: {},        // 检查项展开状态
+    instance: null,     // 展示用实例（服务器数据 + 离线队列叠加）
+    instanceRaw: null,  // 服务器/缓存原样（修订号、基线都以它为准）
+    template: null,
+    tplDraft: null,
+    openItems: {},
     online: navigator.onLine,
     syncing: false,
   };
-  let pendingOps = LS.get("pendingOps", []);
+  let pendingOps = LS.get("pendingOps", []);        // 离线待同步操作
+  let syncConflicts = LS.get("syncConflicts", []);  // 待用户裁决的同步冲突
   const bc = "BroadcastChannel" in window ? new BroadcastChannel("hxwl-ins") : null;
+  const tabId = Math.random().toString(36).slice(2);
 
   /* ---------------- 工具 ---------------- */
   const $ = (sel) => document.querySelector(sel);
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const fmtTime = (iso) => (iso ? new Date(iso).toLocaleString("zh-CN", { hour12: false }) : "-");
+  const STATUS_LABEL = { pass: "通过", fail: "不通过", na: "不适用" };
 
   function toast(msg, kind) {
     const el = document.createElement("div");
@@ -41,8 +50,7 @@
   }
 
   function modal(html) {
-    const root = $("#modal-root");
-    root.innerHTML = `<div class="mask" onclick="if(event.target===this)App.closeModal()"><div class="modal">${html}</div></div>`;
+    $("#modal-root").innerHTML = `<div class="mask" onclick="if(event.target===this)App.closeModal()"><div class="modal">${html}</div></div>`;
   }
   function closeModal() { $("#modal-root").innerHTML = ""; }
 
@@ -55,12 +63,27 @@
 
   function renderNetStatus() {
     const el = $("#net-status");
-    if (!state.online) { el.textContent = "● 离线中（可继续编辑）"; el.className = "net-status offline"; }
-    else if (pendingOps.length) { el.textContent = `● 待同步 ${pendingOps.length} 条`; el.className = "net-status pending"; }
-    else { el.textContent = "● 在线"; el.className = "net-status"; }
+    if (syncConflicts.length) {
+      el.innerHTML = `<span style="cursor:pointer" onclick="App.showConflictModal()">⚠ ${syncConflicts.length} 个冲突待处理</span>`;
+      el.className = "net-status offline";
+    } else if (!state.online) {
+      el.textContent = pendingOps.length ? `● 离线中 · 待同步 ${pendingOps.length} 条` : "● 离线中（可继续编辑）";
+      el.className = "net-status offline";
+    } else if (pendingOps.length) {
+      el.textContent = `● 待同步 ${pendingOps.length} 条`;
+      el.className = "net-status pending";
+    } else {
+      el.textContent = "● 在线";
+      el.className = "net-status";
+    }
   }
 
-  /* ---------------- API 封装（含离线队列） ---------------- */
+  /* ---------------- 角色 ---------------- */
+  const hasRole = (...roles) => !!state.user && state.user.roles.some((r) => roles.includes(r));
+  const canRecord = () => hasRole("engineer", "admin");   // 结果录入/附件/缺陷处置
+  const canVerify = () => hasRole("inspector", "admin");  // 缺陷复检
+
+  /* ---------------- API 封装 ---------------- */
   class OfflineError extends Error {}
 
   async function api(path, opts = {}) {
@@ -88,73 +111,175 @@
     return data;
   }
 
-  /** 结果保存：离线时入本地队列并乐观更新，联网后自动同步 */
+  /* ---------------- 离线队列 ---------------- */
+  function persistOps() { LS.set("pendingOps", pendingOps); }
+  function persistConflicts() { LS.set("syncConflicts", syncConflicts); }
+  function removeOp(op) { pendingOps = pendingOps.filter((o) => o !== op); persistOps(); }
+
+  /** 结果保存：离线时入队（记录编辑基线），联网时直交服务器 */
   async function saveResult(insId, itemCode, payload) {
     if (!state.online) {
-      pendingOps = pendingOps.filter((o) => !(o.insId === insId && o.itemCode === itemCode));
-      pendingOps.push({ insId, itemCode, ...payload, at: Date.now() });
-      LS.set("pendingOps", pendingOps);
-      if (state.instance && state.instance.id === insId) {
-        state.instance.results[itemCode] = { ...payload, updatedBy: state.user.displayName + "(离线)", updatedAt: new Date().toISOString() };
-      }
+      const existing = pendingOps.find((o) => o.insId === insId && o.itemCode === itemCode);
+      // 基线 = 入队那一刻的服务器已知值；同一项重复离线编辑时保留最初基线
+      const baseResult = existing
+        ? existing.baseResult
+        : (state.instanceRaw && state.instanceRaw.results[itemCode]) || null;
+      if (existing) pendingOps = pendingOps.filter((o) => o !== existing);
+      pendingOps.push({ insId, itemCode, ...payload, baseResult, at: Date.now() });
+      persistOps();
+      refreshDisplayInstance();
       renderNetStatus();
+      renderInstance();
       toast("已离线保存，联网后自动同步", "ok");
       return null;
     }
     const data = await api(`/api/instances/${insId}/results/${encodeURIComponent(itemCode)}`, {
       method: "PUT",
-      body: { ...payload, baseRevision: state.instance ? state.instance.revision : undefined },
+      body: { ...payload, baseRevision: state.instanceRaw ? state.instanceRaw.revision : undefined },
     });
     return data.instance;
   }
 
+  /** 服务器原样 → 缓存 + 叠加离线队列得到展示实例 */
+  function setRawInstance(raw) {
+    state.instanceRaw = raw;
+    LS.set(`cache:ins:${raw.id}`, raw);
+    refreshDisplayInstance();
+  }
+  function refreshDisplayInstance() {
+    if (!state.instanceRaw) return;
+    state.instance = Offline.applyOps(state.instanceRaw, pendingOps);
+  }
+
+  function addConflict(op, server, note) {
+    syncConflicts.push({
+      insId: op.insId,
+      itemCode: op.itemCode,
+      mine: { status: op.status, value: op.value || "", notes: op.notes || "" },
+      server: server ? Offline.normResult(server) : null,
+      note: note || "",
+      at: Date.now(),
+    });
+    persistConflicts();
+  }
+
+  /** 联网同步：基线比对，能提交的提交，冲突的保留双方交给用户裁决 */
   async function syncPending() {
-    if (!state.online || state.syncing || !pendingOps.length || !state.token) return;
+    if (!state.online || state.syncing || !state.token || !pendingOps.length) { renderNetStatus(); return; }
     state.syncing = true;
-    const ops = pendingOps.slice();
-    for (const op of ops) {
+    const byIns = {};
+    for (const op of pendingOps) (byIns[op.insId] = byIns[op.insId] || []).push(op);
+    for (const insId of Object.keys(byIns)) {
+      let fresh;
       try {
-        const fresh = await api(`/api/instances/${op.insId}`);
-        await api(`/api/instances/${op.insId}/results/${encodeURIComponent(op.itemCode)}`, {
-          method: "PUT",
-          body: { status: op.status, value: op.value, notes: op.notes, baseRevision: fresh.instance.revision },
-        });
-        pendingOps = pendingOps.filter((o) => o !== op);
-        LS.set("pendingOps", pendingOps);
+        fresh = (await api(`/api/instances/${insId}`)).instance;
       } catch (e) {
-        if (e.status === 409) {
-          setConflict(`检查项 ${op.itemCode} 同步时与他人修改冲突，已保留对方数据，请刷新确认`);
-          pendingOps = pendingOps.filter((o) => o !== op);
-          LS.set("pendingOps", pendingOps);
-        } else if (e.status === 423) {
-          toast("检查单已签署，离线修改无法同步", "error");
-          pendingOps = pendingOps.filter((o) => o !== op);
-          LS.set("pendingOps", pendingOps);
-        } else if (!(e instanceof OfflineError)) {
-          toast(`同步失败：${e.message}`, "error");
-          pendingOps = pendingOps.filter((o) => o !== op);
-          LS.set("pendingOps", pendingOps);
+        continue; // 仍不可达，保留队列下轮再试
+      }
+      const ops = byIns[insId];
+      if (fresh.status === "signed") {
+        // 已签署只读：离线修改不能提交，全部转冲突由用户决定（绝不静默丢弃/覆盖）
+        for (const op of ops) {
+          if (Offline.resultsEqual(fresh.results[op.itemCode] || null, op)) removeOp(op);
+          else { addConflict(op, fresh.results[op.itemCode] || null, "检查单已签署，离线修改无法直接提交"); removeOp(op); }
+        }
+        continue;
+      }
+      const plan = Offline.planSync(ops, fresh);
+      for (const op of plan.noop) removeOp(op);
+      for (const c of plan.conflict) { addConflict(c.op, c.server); removeOp(c.op); }
+      for (const op of plan.apply) {
+        try {
+          const r = await api(`/api/instances/${insId}/results/${encodeURIComponent(op.itemCode)}`, {
+            method: "PUT",
+            body: { status: op.status, value: op.value, notes: op.notes, baseRevision: fresh.revision },
+          });
+          fresh = r.instance;
+          removeOp(op);
+        } catch (e) {
+          if (e.status === 409) { addConflict(op, null, "提交时数据再次被他人修改"); removeOp(op); }
+          else if (e.status === 423) { addConflict(op, null, "检查单已签署"); removeOp(op); }
+          else if (e.status === 403) { addConflict(op, null, "当前账号无录入权限（需工程师角色）"); removeOp(op); }
+          else if (e instanceof OfflineError) { break; }
+          else { removeOp(op); toast(`同步失败：${e.message}`, "error"); }
         }
       }
     }
     state.syncing = false;
     renderNetStatus();
-    if (state.view === "instance" && state.instance) openInstance(state.instance.id, true);
+    if (syncConflicts.length) showConflictModal();
+    if (state.view === "instance" && state.instanceRaw) openInstance(state.instanceRaw.id, true);
     if (state.view === "dash") loadDash();
+  }
+
+  /* ---------------- 冲突裁决（保留双方，明示选择） ---------------- */
+  function resultText(r) {
+    if (!r) return "（无记录）";
+    const parts = [STATUS_LABEL[r.status] || r.status];
+    if (r.value) parts.push("值:" + r.value);
+    if (r.notes) parts.push("备注:" + r.notes);
+    return parts.join(" · ");
+  }
+
+  function showConflictModal() {
+    if (!syncConflicts.length) { closeModal(); return; }
+    const rows = syncConflicts.map((c, i) => `
+      <div class="defect-box">
+        <div class="desc">检查项 ${esc(c.itemCode)} ${c.note ? `<span class="badge open">${esc(c.note)}</span>` : ""}</div>
+        <div class="flow">
+          <div>📱 我的离线修改：<strong>${esc(resultText(c.mine))}</strong></div>
+          <div>🖥 对方（服务器）当前：<strong>${esc(resultText(c.server))}</strong></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn small primary" onclick="App.resolveConflict(${i},'mine')">采用我的修改</button>
+          <button class="btn small" onclick="App.resolveConflict(${i},'theirs')">保留对方的</button>
+        </div>
+      </div>`).join("");
+    modal(`<h3>同步冲突（${syncConflicts.length} 项）</h3>
+      <p class="meta" style="color:var(--muted);font-size:13px">离线期间这些检查项被他人修改。双方内容均已保留，请逐项明确选择，系统不会自动覆盖任何一方。</p>
+      ${rows}`);
+  }
+
+  async function resolveConflict(index, keep) {
+    const c = syncConflicts[index];
+    if (!c) return;
+    if (keep === "mine") {
+      try {
+        const fresh = (await api(`/api/instances/${c.insId}`)).instance;
+        if (fresh.status === "signed") {
+          toast("检查单已签署只读，无法提交；请先撤销签署", "error");
+          return;
+        }
+        await api(`/api/instances/${c.insId}/results/${encodeURIComponent(c.itemCode)}`, {
+          method: "PUT",
+          body: { ...c.mine, baseRevision: fresh.revision },
+        });
+        toast(`已提交 ${c.itemCode} 的离线修改`, "ok");
+      } catch (e) {
+        handleApiError(e, c.insId);
+        return;
+      }
+    } else {
+      toast(`已保留 ${c.itemCode} 的服务器内容`, "ok");
+    }
+    syncConflicts.splice(index, 1);
+    persistConflicts();
+    renderNetStatus();
+    if (syncConflicts.length) showConflictModal();
+    else { closeModal(); boot(); }
   }
 
   /* ---------------- 多标签协调 ---------------- */
   function broadcastChanged(insId, revision) {
     if (bc) bc.postMessage({ type: "instance-changed", insId, revision, tab: tabId });
   }
-  const tabId = Math.random().toString(36).slice(2);
   if (bc) {
     bc.onmessage = (ev) => {
       const m = ev.data || {};
       if (m.tab === tabId) return;
-      if (m.type === "instance-changed" && state.view === "instance" && state.instance && state.instance.id === m.insId) {
+      if (m.type === "instance-changed" && state.view === "instance" && state.instanceRaw && state.instanceRaw.id === m.insId) {
         const dirty = pendingOps.some((o) => o.insId === m.insId) || hasDrafts(m.insId);
-        if (dirty) setConflict("另一个标签页已修改此检查单，而本页有未同步的编辑");
+        if (dirty) setConflict("另一个标签页已修改此检查单，而本页有未同步的编辑；联网同步时将逐项提示冲突，不会自动覆盖");
         else openInstance(m.insId, true);
       }
     };
@@ -172,8 +297,7 @@
       setConflict(e.message || "数据已被他人修改，请刷新");
       if (contextInsId) openInstance(contextInsId, true);
     } else if (e.status === 401) {
-      logout();
-      toast("登录已失效，请重新登录", "error");
+      if (state.token) { logout(); toast("登录已失效，请重新登录", "error"); }
     } else if (e instanceof OfflineError) {
       toast("当前离线，该操作需要联网", "error");
     } else {
@@ -204,8 +328,8 @@
       });
       state.token = data.token; state.user = data.user;
       LS.set("token", data.token); LS.set("user", data.user);
-      location.hash = "#/dash";
-      boot();
+      if (location.hash === "#/dash") boot(); // 避免 hash 赋值与直接调用造成双重 boot
+      else location.hash = "#/dash";
     } catch (e) { toast(e.message, "error"); }
   }
 
@@ -213,8 +337,8 @@
     try { await api("/api/auth/logout", { method: "POST" }); } catch {}
     state.token = null; state.user = null;
     LS.del("token"); LS.del("user");
-    location.hash = "#/login";
-    boot();
+    if (location.hash === "#/login") boot();
+    else location.hash = "#/login";
   }
 
   /* ---------------- 看板 ---------------- */
@@ -230,16 +354,40 @@
     }
   }
 
+  function cachedInstances() {
+    const out = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("cache:ins:")) {
+        const v = LS.get(k, null);
+        if (v && v.id) out.push(v);
+      }
+    }
+    return out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  }
+
   function renderDashOffline() {
-    $("#app").innerHTML = `<div class="card"><h2>离线模式</h2><p>当前无网络连接。已缓存的检查单可继续查看编辑（打开过的检查单会保留在本地）。</p>
-      ${pendingOps.length ? `<p>有 ${pendingOps.length} 条修改待同步。</p>` : ""}</div>`;
+    const cached = cachedInstances();
+    const rows = cached.map((i) => {
+      const pending = pendingOps.filter((o) => o.insId === i.id).length;
+      return `<div class="list-row" onclick="App.openInstance('${i.id}')">
+        <div class="grow"><div class="title">${esc(i.title)} <span class="badge ${i.status}">${i.status === "signed" ? "已签署" : "进行中"}</span></div>
+        <div class="meta">离线缓存 · ${esc(i.aircraft || "")} ${pending ? ` · ${pending} 条待同步` : ""}</div></div><span>›</span></div>`;
+    }).join("");
+    $("#app").innerHTML = `<div class="card">
+      <h2>离线模式</h2>
+      <p>当前无网络连接。以下已访问过的检查单可继续打开编辑，修改会保存在本机，联网后自动同步。</p>
+      ${pendingOps.length ? `<p>有 ${pendingOps.length} 条修改待同步。</p>` : ""}
+      ${syncConflicts.length ? `<p style="color:var(--danger)">有 ${syncConflicts.length} 个冲突待处理。</p>` : ""}
+    </div>
+    ${rows || '<div class="empty">本机暂无缓存的检查单</div>'}`;
   }
 
   function dashTab() { return state.dashTab || "instances"; }
 
   function renderDash() {
     const tab = dashTab();
-    const isAdmin = state.user.roles.includes("admin");
+    const isAdmin = hasRole("admin");
     $("#app").innerHTML = `
       <div class="tabs">
         <button class="${tab === "instances" ? "active" : ""}" onclick="App.switchTab('instances')">检查单</button>
@@ -261,7 +409,6 @@
     }).join("");
     return `<div class="view-title"><h1>检查单</h1>
         <button class="btn primary" onclick="App.newInstanceModal()">＋ 新建检查单</button>
-        <button class="btn" onclick="App.exportAllHint()">导出</button>
         <label class="btn" style="margin:0">导入整包<input type="file" accept=".json,.aipkg" style="display:none" onchange="App.importPackage(this)"></label>
       </div>
       ${state.instances.length ? rows : '<div class="empty">暂无检查单，点击"新建检查单"开始</div>'}`;
@@ -269,7 +416,7 @@
 
   function templatesHtml(isAdmin) {
     const rows = state.templates.map((t) => {
-      const vers = t.versions.map((v) => `<span class="badge ${v.status}" title="${esc(v.hash.slice(0, 12))}">v${v.versionNo} ${v.status === "published" ? "已发布" : "草稿"}</span>`).join(" ");
+      const vers = t.versions.map((v) => `<span class="badge ${v.status}">v${v.versionNo} ${v.status === "published" ? "已发布" : "草稿"}</span>`).join(" ");
       return `<div class="list-row" onclick="App.openTemplate('${t.id}')">
         <div class="grow"><div class="title">${esc(t.name)}</div>
         <div class="meta">${esc(t.ataChapter || "")} ${esc(t.description || "")}</div>
@@ -289,13 +436,14 @@
       state.tplDraft = draft ? JSON.parse(JSON.stringify(draft.items)) : null;
       state.tplDraftVersionId = draft ? draft.id : null;
       state.view = "template";
+      history.replaceState(null, "", `#/tpl/${tplId}`);
       renderTemplate();
     } catch (e) { handleApiError(e); }
   }
 
   function renderTemplate(errors) {
     const t = state.template;
-    const isAdmin = state.user.roles.includes("admin");
+    const isAdmin = hasRole("admin");
     const versions = t.versions.map((v) => `
       <div class="list-row" style="cursor:default">
         <div class="grow"><span class="badge ${v.status}">v${v.versionNo} ${v.status === "published" ? "已发布·冻结" : "草稿"}</span>
@@ -375,55 +523,71 @@
   async function openInstance(insId, silent) {
     try {
       const data = await api(`/api/instances/${insId}`);
-      state.instance = data.instance;
-      LS.set(`cache:ins:${insId}`, data.instance);
+      setRawInstance(data.instance);
       state.view = "instance";
+      // 同步地址栏（不触发 hashchange），刷新后仍停留在本检查单
+      history.replaceState(null, "", `#/ins/${insId}`);
       renderInstance();
     } catch (e) {
       if (e instanceof OfflineError) {
         const cached = LS.get(`cache:ins:${insId}`, null);
-        if (cached) { state.instance = cached; state.view = "instance"; renderInstance(); toast("离线查看缓存数据", ""); }
-        else toast("离线且无缓存，无法打开", "error");
+        if (cached) {
+          state.instanceRaw = cached; // 缓存不进 LS 重复写
+          refreshDisplayInstance();
+          state.view = "instance";
+          history.replaceState(null, "", `#/ins/${insId}`);
+          renderInstance();
+          toast("离线查看本机缓存，可继续编辑", "");
+        } else if (!silent) toast("离线且无缓存，无法打开", "error");
       } else if (!silent) handleApiError(e);
     }
   }
 
-  const STATUS_LABEL = { pass: "通过", fail: "不通过", na: "不适用" };
+  function displayProgress(ins) {
+    const applicable = ins.items.filter((i) => i.applicable);
+    const completed = applicable.filter((i) => ins.results[i.code] && ins.results[i.code].status).length;
+    return { applicable: applicable.length, completed, openDefects: ins.defects.filter((d) => d.status !== "closed").length };
+  }
 
   function renderInstance() {
     const ins = state.instance;
+    if (!ins) return;
     const locked = ins.status === "signed";
-    const pct = ins.progress.applicable ? Math.round((ins.progress.completed / ins.progress.applicable) * 100) : 0;
+    const prog = displayProgress(ins);
+    const pct = prog.applicable ? Math.round((prog.completed / prog.applicable) * 100) : 0;
     $("#app").innerHTML = `
       <div class="view-title">
         <button class="btn ghost" onclick="App.back()">‹ 返回</button>
         <h1>${esc(ins.title)}</h1>
         <span class="badge ${ins.status}">${locked ? "已签署·只读" : "进行中"}</span>
-        <div class="sub">${esc(ins.templateName)} v${ins.versionNo} · 机号 ${esc(ins.aircraft || "-")} · 创建 ${esc(ins.createdBy)} ${fmtTime(ins.createdAt)} · 修订号 r${ins.revision}${state.online ? "" : " · （离线缓存）"}</div>
+        <div class="sub">${esc(ins.templateName)} v${ins.versionNo} · 机号 ${esc(ins.aircraft || "-")} · 创建 ${esc(ins.createdBy)} ${fmtTime(ins.createdAt)} · 修订号 r${ins.revision}${state.online ? "" : " · （离线缓存，可编辑）"}</div>
       </div>
       <div class="card">
         <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
-        <div class="meta" style="margin-top:6px">完成 ${ins.progress.completed}/${ins.progress.applicable} · 未闭环缺陷 ${ins.progress.openDefects} · 签署 ${ins.signatures.length}/2</div>
+        <div class="meta" style="margin-top:6px">完成 ${prog.completed}/${prog.applicable} · 未闭环缺陷 ${prog.openDefects} · 签署 ${ins.signatures.length}/2</div>
       </div>
       <div class="card"><h2>检查项</h2>${ins.items.map((it) => itemHtml(it, locked)).join("")}</div>
       ${signHtml(ins, locked)}
       <div class="card"><h2>操作</h2><div class="btn-row">
-        <button class="btn" onclick="App.exportInstance()">导出整包（含附件）</button>
-        <button class="btn" onclick="App.showAudit()">审计轨迹</button>
-        ${locked ? `<button class="btn danger" onclick="App.revokeModal()">撤销签署</button>` : ""}
+        <button class="btn" ${state.online ? "" : "disabled"} onclick="App.exportInstance()">导出整包（含附件）</button>
+        <button class="btn" ${state.online ? "" : "disabled"} onclick="App.showAudit()">审计轨迹</button>
+        ${locked ? `<button class="btn danger" ${state.online && canVerify() ? "" : "disabled"} onclick="App.revokeModal()">撤销签署</button>` : ""}
       </div></div>`;
   }
 
   function itemHtml(it, locked) {
     const ins = state.instance;
     const open = state.openItems[it.code];
-    const r = ins.results[it.code];
+    const serverResult = ins.results[it.code];
     const draft = LS.get(`draft:${ins.id}:${it.code}`, null);
-    const cur = draft || r || {};
+    const cur = draft || serverResult || {};
     const applicable = it.applicable;
     const depBlocked = it.unmetDependencies && it.unmetDependencies.length > 0;
-    const canEdit = !locked && applicable && !depBlocked && state.online;
-    const headStatus = r ? `<span class="badge ${r.status === "pass" ? "closed" : r.status === "fail" ? "open" : "draft"}">${STATUS_LABEL[r.status]}</span>` : (applicable ? '<span class="badge in_progress">待录入</span>' : '<span class="badge draft">不适用</span>');
+    // 录入权限：工程师/管理员；离线可录（入队）；签署后只读；依赖未满足锁定
+    const editable = !locked && applicable && !depBlocked && canRecord();
+    const headStatus = serverResult
+      ? `<span class="badge ${serverResult.status === "pass" ? "closed" : serverResult.status === "fail" ? "open" : "draft"}">${STATUS_LABEL[serverResult.status]}${serverResult.offline ? "·待同步" : ""}</span>`
+      : (applicable ? '<span class="badge in_progress">待录入</span>' : '<span class="badge draft">不适用</span>');
     const defects = (it.defects || []).map((d) => defectHtml(d, locked)).join("");
     const attachments = ins.attachments.filter((a) => a.itemCode === it.code);
     return `<div class="item-card ${!applicable || depBlocked ? "locked" : ""}">
@@ -435,14 +599,15 @@
         ${it.deps && it.deps.length ? `<div class="dep-note">前置依赖：${it.deps.map((d) => esc(d)).join("、")}${depBlocked ? "（未完成，暂不可录入）" : "（已满足）"}</div>` : ""}
         ${it.visibleWhen ? `<div class="cond-note">条件项：当 ${esc(it.visibleWhen.code)} 结果为 ${it.visibleWhen.in.map((s) => STATUS_LABEL[s]).join("/")} 时适用</div>` : ""}
         ${applicable ? `
+        ${!canRecord() ? `<div class="cond-note">当前为${hasRole("inspector") ? "检验" : "只读"}角色：结果与附件由工程师录入，您可执行复检与签署。</div>` : ""}
         <div class="result-btns">
-          ${["pass", "fail", "na"].map((s) => `<button class="${cur.status === s ? "sel-" + s : ""}" ${canEdit ? "" : "disabled"} onclick="App.setResult('${esc(it.code)}','${s}')">${STATUS_LABEL[s]}</button>`).join("")}
+          ${["pass", "fail", "na"].map((s) => `<button class="${cur.status === s ? "sel-" + s : ""}" ${editable ? "" : "disabled"} onclick="App.setResult('${esc(it.code)}','${s}')">${STATUS_LABEL[s]}</button>`).join("")}
         </div>
-        <label class="field"><span>测量值/参数</span><input type="text" value="${esc(cur.value || "")}" ${canEdit ? "" : "disabled"} oninput="App.draft('${esc(it.code)}','value',this.value)" onchange="App.saveItem('${esc(it.code)}')"></label>
-        <label class="field"><span>备注</span><textarea ${canEdit ? "" : "disabled"} oninput="App.draft('${esc(it.code)}','notes',this.value)" onchange="App.saveItem('${esc(it.code)}')">${esc(cur.notes || "")}</textarea></label>
+        <label class="field"><span>测量值/参数</span><input type="text" value="${esc(cur.value || "")}" ${editable ? "" : "disabled"} oninput="App.draft('${esc(it.code)}','value',this.value)" onchange="App.saveItem('${esc(it.code)}')"></label>
+        <label class="field"><span>备注</span><textarea ${editable ? "" : "disabled"} oninput="App.draft('${esc(it.code)}','notes',this.value)" onchange="App.saveItem('${esc(it.code)}')">${esc(cur.notes || "")}</textarea></label>
         <div>
-          ${attachments.map((a) => `<span class="attach-chip">📎 <a href="javascript:App.downloadAttachment('${a.id}')">${esc(a.name)}</a> (${Math.round(a.size / 1024)}KB)${locked ? "" : ` <button onclick="App.removeAttachment('${a.id}')" title="删除">×</button>`}</span>`).join("")}
-          ${!locked && state.online ? `<label class="btn small" style="margin-top:6px">上传附件<input type="file" style="display:none" onchange="App.uploadAttachment('${esc(it.code)}',this)"></label>` : ""}
+          ${attachments.map((a) => `<span class="attach-chip">📎 <a href="javascript:App.downloadAttachment('${a.id}')">${esc(a.name)}</a> (${Math.round(a.size / 1024)}KB)${!locked && canRecord() ? ` <button onclick="App.removeAttachment('${a.id}')" title="删除">×</button>` : ""}</span>`).join("")}
+          ${!locked && canRecord() ? `<label class="btn small" style="margin-top:6px;${state.online ? "" : "opacity:.45;pointer-events:none"}" title="${state.online ? "" : "附件上传需要联网"}">上传附件<input type="file" style="display:none" ${state.online ? "" : "disabled"} onchange="App.uploadAttachment('${esc(it.code)}',this)"></label>` : ""}
         </div>
         ${defects}
         ${!locked && state.online ? `<button class="btn small danger" style="margin-top:8px" onclick="App.defectModal('${esc(it.code)}')">＋ 登记缺陷</button>` : ""}
@@ -452,16 +617,15 @@
   }
 
   function defectHtml(d, locked) {
-    const ins = state.instance;
     const flow = d.history.map((h) => `<div>· ${fmtTime(h.at)} ${esc(h.by)}：${esc(actionLabel(h.action))} ${esc(h.note || "")}</div>`).join("");
-    const canDispose = !locked && d.status === "open" && state.online && (state.user.roles.includes("engineer") || state.user.roles.includes("admin"));
-    const canVerify = !locked && d.status === "disposed" && state.online && (state.user.roles.includes("inspector") || state.user.roles.includes("admin"));
+    const showDispose = !locked && d.status === "open" && state.online && canRecord();
+    const showVerify = !locked && d.status === "disposed" && state.online && canVerify();
     return `<div class="defect-box ${d.status === "closed" ? "closed" : ""}">
       <div class="desc">缺陷 · ${esc(d.description)} <span class="badge ${d.status}">${d.status === "open" ? "待处置" : d.status === "disposed" ? "待复检" : "已闭环"}</span></div>
       <div class="flow">${flow}</div>
       <div class="btn-row">
-        ${canDispose ? `<button class="btn small" onclick="App.dispositionModal('${d.id}')">填写处置措施</button>` : ""}
-        ${canVerify ? `<button class="btn small primary" onclick="App.verifyModal('${d.id}')">复检（须非处置人）</button>` : ""}
+        ${showDispose ? `<button class="btn small" onclick="App.dispositionModal('${d.id}')">填写处置措施</button>` : ""}
+        ${showVerify ? `<button class="btn small primary" onclick="App.verifyModal('${d.id}')">复检（须非处置人）</button>` : ""}
       </div>
     </div>`;
   }
@@ -492,6 +656,7 @@
   }
 
   function draft(itemCode, field, value) {
+    if (!canRecord()) return;
     const ins = state.instance;
     const key = `draft:${ins.id}:${itemCode}`;
     const d = LS.get(key, {});
@@ -501,6 +666,7 @@
   }
 
   async function setResult(itemCode, status) {
+    if (!canRecord()) { toast("当前角色无录入权限（需工程师）", "error"); return; }
     const ins = state.instance;
     const key = `draft:${ins.id}:${itemCode}`;
     const d = LS.get(key, {});
@@ -510,25 +676,28 @@
   }
 
   async function saveItem(itemCode) {
+    if (!canRecord()) return;
     const ins = state.instance;
     const key = `draft:${ins.id}:${itemCode}`;
     const d = LS.get(key, null);
-    if (!d || !d.status) { if (d && !d.status) toast("请先选择 通过/不通过/不适用", "error"); return; }
+    if (!d || !d.status) { toast("请先选择 通过/不通过/不适用", "error"); return; }
     try {
       const updated = await saveResult(ins.id, itemCode, { status: d.status, value: d.value || "", notes: d.notes || "" });
       LS.del(key);
       if (updated) {
-        state.instance = updated;
-        LS.set(`cache:ins:${ins.id}`, updated);
+        // 在线保存成功：清掉同项可能残留的离线队列，避免旧队列回写
+        pendingOps = pendingOps.filter((o) => !(o.insId === ins.id && o.itemCode === itemCode));
+        persistOps();
+        setRawInstance(updated);
         broadcastChanged(ins.id, updated.revision);
         renderInstance();
-      } else {
-        renderInstance(); // 离线：乐观更新已生效
       }
+      // 离线：saveResult 已完成入队与渲染
     } catch (e) { handleApiError(e, ins.id); }
   }
 
   async function uploadAttachment(itemCode, input) {
+    if (!canRecord()) { toast("当前角色无附件上传权限（需工程师）", "error"); return; }
     const file = input.files[0];
     if (!file) return;
     const dataUrl = await new Promise((resolve, reject) => {
@@ -539,20 +708,20 @@
     });
     const base64 = String(dataUrl).split(",")[1] || "";
     try {
-      const data = await api(`/api/instances/${state.instance.id}/results/${encodeURIComponent(itemCode)}/attachments`, {
+      const data = await api(`/api/instances/${state.instanceRaw.id}/results/${encodeURIComponent(itemCode)}/attachments`, {
         method: "POST",
-        body: { name: file.name, mime: file.type, data: base64, baseRevision: state.instance.revision },
+        body: { name: file.name, mime: file.type, data: base64, baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       renderInstance();
       toast("附件已上传", "ok");
-    } catch (e) { handleApiError(e, state.instance.id); }
+    } catch (e) { handleApiError(e, state.instanceRaw.id); }
   }
 
   async function downloadAttachment(attId) {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/attachments/${attId}`);
+      const data = await api(`/api/instances/${state.instanceRaw.id}/attachments/${attId}`);
       const a = document.createElement("a");
       a.href = `data:${data.attachment.mime};base64,${data.attachment.data}`;
       a.download = data.attachment.name;
@@ -561,14 +730,15 @@
   }
 
   async function removeAttachment(attId) {
+    if (!canRecord()) return;
     try {
-      const data = await api(`/api/instances/${state.instance.id}/attachments/${attId}`, {
-        method: "DELETE", body: { baseRevision: state.instance.revision },
+      const data = await api(`/api/instances/${state.instanceRaw.id}/attachments/${attId}`, {
+        method: "DELETE", body: { baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       renderInstance();
-    } catch (e) { handleApiError(e, state.instance.id); }
+    } catch (e) { handleApiError(e, state.instanceRaw.id); }
   }
 
   /* ---------------- 缺陷 ---------------- */
@@ -580,14 +750,14 @@
 
   async function submitDefect(itemCode) {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/defects`, {
+      const data = await api(`/api/instances/${state.instanceRaw.id}/defects`, {
         method: "POST",
-        body: { itemCode, description: $("#df-desc").value, baseRevision: state.instance.revision },
+        body: { itemCode, description: $("#df-desc").value, baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       closeModal(); renderInstance(); toast("缺陷已登记", "ok");
-    } catch (e) { handleApiError(e, state.instance.id); }
+    } catch (e) { handleApiError(e, state.instanceRaw.id); }
   }
 
   function dispositionModal(defectId) {
@@ -598,14 +768,14 @@
 
   async function submitDisposition(defectId) {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/defects/${defectId}/disposition`, {
+      const data = await api(`/api/instances/${state.instanceRaw.id}/defects/${defectId}/disposition`, {
         method: "POST",
-        body: { text: $("#dp-text").value, baseRevision: state.instance.revision },
+        body: { text: $("#dp-text").value, baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       closeModal(); renderInstance(); toast("处置已提交，待他人复检", "ok");
-    } catch (e) { handleApiError(e, state.instance.id); }
+    } catch (e) { handleApiError(e, state.instanceRaw.id); }
   }
 
   function verifyModal(defectId) {
@@ -620,14 +790,14 @@
 
   async function submitVerify(defectId, result) {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/defects/${defectId}/verify`, {
+      const data = await api(`/api/instances/${state.instanceRaw.id}/defects/${defectId}/verify`, {
         method: "POST",
-        body: { result, notes: $("#vf-notes").value, baseRevision: state.instance.revision },
+        body: { result, notes: $("#vf-notes").value, baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       closeModal(); renderInstance(); toast(result === "pass" ? "缺陷已闭环" : "缺陷已重新打开", "ok");
-    } catch (e) { handleApiError(e, state.instance.id); }
+    } catch (e) { handleApiError(e, state.instanceRaw.id); }
   }
 
   /* ---------------- 签署 / 撤销 ---------------- */
@@ -642,19 +812,19 @@
 
   async function submitSign() {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/sign`, {
+      const data = await api(`/api/instances/${state.instanceRaw.id}/sign`, {
         method: "POST",
-        body: { username: $("#sg-user").value.trim(), password: $("#sg-pass").value, baseRevision: state.instance.revision },
+        body: { username: $("#sg-user").value.trim(), password: $("#sg-pass").value, baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       closeModal(); renderInstance();
       toast(data.instance.status === "signed" ? "双人签署完成，检查单已锁定" : "第 1 位签署完成，待第 2 位签署", "ok");
     } catch (e) {
       if (e.data && e.data.blockers) {
         modal(`<h3>暂不能签署</h3><ul class="blocker-list">${e.data.blockers.map((b) => `<li>${esc(b)}</li>`).join("")}</ul>
           <div class="btn-row"><button class="btn" onclick="App.closeModal()">知道了</button></div>`);
-      } else handleApiError(e, state.instance.id);
+      } else handleApiError(e, state.instanceRaw.id);
     }
   }
 
@@ -667,20 +837,20 @@
 
   async function submitRevoke() {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/revoke`, {
+      const data = await api(`/api/instances/${state.instanceRaw.id}/revoke`, {
         method: "POST",
-        body: { reason: $("#rv-reason").value, baseRevision: state.instance.revision },
+        body: { reason: $("#rv-reason").value, baseRevision: state.instanceRaw.revision },
       });
-      state.instance = data.instance;
-      broadcastChanged(state.instance.id, data.instance.revision);
+      setRawInstance(data.instance);
+      broadcastChanged(data.instance.id, data.instance.revision);
       closeModal(); renderInstance(); toast("已撤销签署并留痕", "ok");
-    } catch (e) { handleApiError(e, state.instance.id); }
+    } catch (e) { handleApiError(e, state.instanceRaw.id); }
   }
 
   /* ---------------- 审计 / 导入导出 ---------------- */
   async function showAudit() {
     try {
-      const data = await api(`/api/instances/${state.instance.id}/audit`);
+      const data = await api(`/api/instances/${state.instanceRaw.id}/audit`);
       const rows = data.audits.map((a) => `<div class="audit-row"><span class="who">${esc(a.actorName)}</span> ${esc(a.action)} <span class="mono">${esc(JSON.stringify(a.detail))}</span><span class="when">${fmtTime(a.at)}</span></div>`).join("");
       modal(`<h3>审计轨迹</h3>${rows || '<div class="empty">暂无记录</div>'}<div class="btn-row" style="margin-top:10px"><button class="btn" onclick="App.closeModal()">关闭</button></div>`);
     } catch (e) { handleApiError(e); }
@@ -688,11 +858,11 @@
 
   async function exportInstance() {
     try {
-      const pkg = await api(`/api/instances/${state.instance.id}/export`);
+      const pkg = await api(`/api/instances/${state.instanceRaw.id}/export`);
       const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: "application/json" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `${state.instance.title || "检查单"}.aipkg.json`;
+      a.download = `${state.instanceRaw.title || "检查单"}.aipkg.json`;
       a.click();
       URL.revokeObjectURL(a.href);
       toast("已导出整包（含附件与校验和）", "ok");
@@ -736,7 +906,7 @@
         body: { templateVersionId: $("#ni-ver").value, title: $("#ni-title").value, aircraft: $("#ni-ac").value },
       });
       closeModal();
-      openInstance(data.instance.id);
+      location.hash = `#/ins/${data.instance.id}`;
     } catch (e) { handleApiError(e); }
   }
 
@@ -782,7 +952,7 @@
 
   window.addEventListener("hashchange", boot);
   window.addEventListener("online", () => { state.online = true; renderNetStatus(); toast("网络已恢复，正在同步…", "ok"); syncPending(); });
-  window.addEventListener("offline", () => { state.online = false; renderNetStatus(); });
+  window.addEventListener("offline", () => { state.online = false; renderNetStatus(); if (state.view === "instance") renderInstance(); if (state.view === "dash") renderDashOffline(); });
 
   /* ---------------- 暴露给内联事件 ---------------- */
   window.App = {
@@ -794,6 +964,7 @@
     signModal, submitSign, revokeModal, submitRevoke,
     showAudit, exportInstance, importPackage,
     newInstanceModal, submitNewInstance, newTemplateModal, submitNewTemplate,
+    showConflictModal, resolveConflict,
     newInstanceFromVersion(verId) {
       modal(`<h3>新建检查单</h3>
         <label class="field"><span>标题</span><input id="ni-title" type="text" placeholder="如：B-1234 航前检查"></label>
@@ -810,7 +981,6 @@
       } catch (e) { handleApiError(e); }
     },
     reloadCurrent() { setConflict(""); boot(); },
-    exportAllHint() { toast("请打开具体检查单后使用「导出整包」", ""); },
     tplSet(idx, field, value) { state.tplDraft[idx][field] = value; },
     tplSetDeps(idx, value) { state.tplDraft[idx].deps = value.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean); },
     tplSetCond(idx, code) { state.tplDraft[idx].visibleWhen = code ? { code, in: ["fail"] } : null; renderTemplate(); },

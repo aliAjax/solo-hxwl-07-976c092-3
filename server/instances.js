@@ -188,8 +188,8 @@ router.get("/:id", requireAuth, (req, res) => {
   res.json({ instance: instanceView(instance) });
 });
 
-/** 录入/修改某检查项结果 */
-router.put("/:id/results/:itemCode", requireAuth, (req, res) => {
+/** 录入/修改某检查项结果（仅工程师/管理员；检验角色只读，复检走缺陷流程） */
+router.put("/:id/results/:itemCode", requireAuth, requireRole("engineer", "admin"), (req, res) => {
   const instance = loadInstance(req, res);
   if (!instance) return;
   if (!assertEditable(instance, res)) return;
@@ -217,8 +217,8 @@ router.put("/:id/results/:itemCode", requireAuth, (req, res) => {
   res.json({ instance: instanceView(instance) });
 });
 
-/** 上传附件（base64，绑定检查项） */
-router.post("/:id/results/:itemCode/attachments", requireAuth, (req, res) => {
+/** 上传附件（base64，绑定检查项；仅工程师/管理员） */
+router.post("/:id/results/:itemCode/attachments", requireAuth, requireRole("engineer", "admin"), (req, res) => {
   const instance = loadInstance(req, res);
   if (!instance) return;
   if (!assertEditable(instance, res)) return;
@@ -250,7 +250,8 @@ router.get("/:id/attachments/:attachmentId", requireAuth, (req, res) => {
   res.json({ attachment });
 });
 
-router.delete("/:id/attachments/:attachmentId", requireAuth, (req, res) => {
+/** 删除附件（仅工程师/管理员） */
+router.delete("/:id/attachments/:attachmentId", requireAuth, requireRole("engineer", "admin"), (req, res) => {
   const instance = loadInstance(req, res);
   if (!instance) return;
   if (!assertEditable(instance, res)) return;
